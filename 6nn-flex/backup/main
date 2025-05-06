@@ -1,0 +1,315 @@
+use ndarray::{Array2, Axis};
+use ndarray_rand::RandomExt;
+use rand_distr::StandardNormal;
+use rand::thread_rng;
+use rand::seq::SliceRandom;
+use csv::ReaderBuilder;
+use std::error::Error;
+use std::thread;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Sender;
+mod frontend_qt;
+use frontend_qt::{TrainingWindow, TrainingParams};
+
+// These are default values, will be overridden by GUI inputs
+const DEFAULT_EPOCHS: usize = 1000;
+const DEFAULT_LR: f64 = 0.5;
+const DEFAULT_HIDDEN: usize = 32;
+const DEFAULT_HIDDEN_LAYERS: usize = 2;
+const LOG_INTERVAL: usize = 100;
+
+fn shuffle_data(x: &Array2<f64>, y: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
+    let mut indices: Vec<usize> = (0..x.nrows()).collect();
+    let mut rng = thread_rng();
+    indices.shuffle(&mut rng);
+
+    let x_shuffled = Array2::from_shape_fn(x.raw_dim(), |(i, j)| x[(indices[i], j)]);
+    let y_shuffled = Array2::from_shape_fn(y.raw_dim(), |(i, j)| y[(indices[i], j)]);
+    (x_shuffled, y_shuffled)
+}
+
+fn relu(x: &Array2<f64>) -> Array2<f64> {
+    x.mapv(|v| v.max(0.0))
+}
+
+fn relu_deriv(x: &Array2<f64>) -> Array2<f64> {
+    x.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 })
+}
+
+fn sigmoid(x: &Array2<f64>) -> Array2<f64> {
+    x.mapv(|v| 1.0 / (1.0 + (-v).exp()))
+}
+
+fn normalize(mut data: Array2<f64>) -> Array2<f64> {
+    for mut col in data.columns_mut() {
+        let mean = col.mean().unwrap();
+        let std = col.mapv(|x| (x - mean).powi(2)).mean().unwrap().sqrt();
+        col -= mean;
+        col /= std.max(1e-8);
+    }
+    data
+}
+
+fn load_data(path: &str) -> Result<(Array2<f64>, Array2<f64>), Box<dyn Error + Send + Sync>> {
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_path(path)?;
+
+    let mut features: Vec<Vec<f64>> = Vec::new();
+    let mut labels: Vec<f64> = Vec::new();
+
+    for result in rdr.records() {
+        let record = result?;
+        let vals: Result<Vec<f64>, _> = record.iter().map(|s| s.trim().parse::<f64>()).collect();
+        if let Ok(vals) = vals {
+            if vals.len() == 10 {
+                let (x, y) = vals.split_at(9); // 9 fitur, 1 label
+                features.push(x.to_vec());
+                labels.push(y[0]);
+            }
+        }
+    }
+
+    let feature_array = Array2::from_shape_vec((features.len(), 9), features.concat())?;
+    let label_array = Array2::from_shape_vec((labels.len(), 1), labels)?;
+
+    Ok((feature_array, label_array))
+}
+
+fn train_network(
+    x: &Array2<f64>, 
+    y_true: &Array2<f64>, 
+    params: &TrainingParams,
+    sender: &Sender<f64>
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (n_samples, n_features) = x.dim();
+    let mut rng = thread_rng();
+    
+    // Guard against bad parameters
+    if params.hidden_layers == 0 {
+        return Err("Number of hidden layers must be at least 1".into());
+    }
+    
+    if params.neurons_per_layer == 0 {
+        return Err("Number of neurons per layer must be at least 1".into());
+    }
+    
+    // Initialize weights and biases for variable number of layers
+    let mut weights = Vec::new();
+    let mut biases = Vec::new();
+    
+    println!("Initializing network with {} features, {} hidden layers, {} neurons per layer", 
+             n_features, params.hidden_layers, params.neurons_per_layer);
+    
+    // Input layer -> first hidden layer
+    weights.push(Array2::random_using((n_features, params.neurons_per_layer), StandardNormal, &mut rng) * 0.1);
+    biases.push(Array2::zeros((1, params.neurons_per_layer)));
+    
+    // Hidden layers
+    for _ in 1..params.hidden_layers {
+        weights.push(Array2::random_using(
+            (params.neurons_per_layer, params.neurons_per_layer), 
+            StandardNormal, 
+            &mut rng
+        ) * 0.1);
+        biases.push(Array2::zeros((1, params.neurons_per_layer)));
+    }
+    
+    // Output layer
+    weights.push(Array2::random_using((params.neurons_per_layer, 1), StandardNormal, &mut rng) * 0.1);
+    biases.push(Array2::zeros((1, 1)));
+    
+    // Training loop
+    for epoch in 0..params.epochs {
+        // Forward pass
+        let mut activations = Vec::new();
+        let mut z_values = Vec::new();
+        
+        // Input layer -> first hidden layer
+        let mut z = x.dot(&weights[0]) + &biases[0];
+        z_values.push(z.clone());
+        let mut a = relu(&z);
+        activations.push(a.clone());
+        
+        // Hidden layers
+        for i in 1..params.hidden_layers {
+            z = a.dot(&weights[i]) + &biases[i];
+            z_values.push(z.clone());
+            a = relu(&z);
+            activations.push(a.clone());
+        }
+        
+        // Output layer
+        z = a.dot(&weights[params.hidden_layers]) + &biases[params.hidden_layers];
+        z_values.push(z.clone());
+        let y_pred = sigmoid(&z);
+        
+        // Backpropagation
+        // Initialize gradients for all layers
+        let mut dw = Vec::with_capacity(params.hidden_layers + 1);
+        let mut db = Vec::with_capacity(params.hidden_layers + 1);
+        
+        // For all layers, initialize with appropriate dimensions
+        for i in 0..=params.hidden_layers {
+            dw.push(Array2::zeros(weights[i].dim()));
+            db.push(Array2::zeros(biases[i].dim()));
+        }
+        
+        // Output layer error
+        let mut delta = &y_pred - y_true;
+        
+        // Output layer gradients
+        dw[params.hidden_layers] = activations.last().unwrap().t().dot(&delta) / n_samples as f64;
+        let db_out = delta.sum_axis(Axis(0)) / n_samples as f64;
+        db[params.hidden_layers] = db_out.into_shape(biases[params.hidden_layers].raw_dim()).unwrap();
+        
+        // Hidden layers gradients
+        for i in (0..params.hidden_layers).rev() {
+            delta = delta.dot(&weights[i+1].t()) * relu_deriv(&z_values[i]);
+            
+            let input = if i == 0 {
+                x
+            } else {
+                &activations[i-1]
+            };
+            
+            dw[i] = input.t().dot(&delta) / n_samples as f64;
+            let db_layer = delta.sum_axis(Axis(0)) / n_samples as f64;
+            db[i] = db_layer.into_shape(biases[i].raw_dim()).unwrap();
+        }
+        
+        // Update weights and biases with learning rate
+        let lr = if epoch < params.epochs / 10 {
+            params.learning_rate  // High learning rate for first 10%
+        } else if epoch < params.epochs / 2 {
+            params.learning_rate * 0.5  // Medium learning rate until halfway
+        } else {
+            params.learning_rate * 0.1  // Low learning rate for final half
+        };
+        
+        for i in 0..=params.hidden_layers {
+            weights[i] -= &(dw[i].clone() * lr);
+            biases[i] -= &(db[i].clone() * lr);
+        }
+        
+        // Calculate accuracy for monitoring
+        let pred_labels = y_pred.mapv(|v| if v >= 0.5 { 1.0 } else { 0.0 });
+        let correct = pred_labels
+            .iter()
+            .zip(y_true.iter())
+            .filter(|(p, y)| (*p - *y).abs() < 1e-6)
+            .count();
+        let accuracy = correct as f64 / n_samples as f64;
+        
+        if epoch % LOG_INTERVAL == 0 || epoch == params.epochs - 1 {
+            println!("Epoch {}/{}: Accuracy = {:.4}", epoch, params.epochs, accuracy);
+        }
+        
+        // Send accuracy update to the UI
+        sender.send(accuracy).unwrap();
+    }
+
+    // Send a completion signal to the UI
+    println!("Training completed");
+    
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 600.0]),
+        ..Default::default()
+    };
+    
+    let (window, accuracy_sender, params_receiver) = TrainingWindow::new();
+    
+    let training_thread = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+        // Load and preprocess data
+        let (x_raw, y_true) = load_data("src/water_potability.csv")?;
+        let x = normalize(x_raw);
+        let (x, y_true) = shuffle_data(&x, &y_true);
+        
+        // Initial training parameters
+        let current_params = Arc::new(Mutex::new(TrainingParams {
+            epochs: DEFAULT_EPOCHS,
+            hidden_layers: DEFAULT_HIDDEN_LAYERS,
+            neurons_per_layer: DEFAULT_HIDDEN,
+            learning_rate: DEFAULT_LR,
+            restart_training: false,
+        }));
+        
+        let should_continue = true;
+        
+        // Main thread loop
+        while should_continue {
+            // Wait for user to initiate/restart training
+            println!("Waiting for user to start/restart training...");
+            
+            // Wait for parameter updates from the UI
+            let train_params = loop {
+                match params_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(new_params) => {
+                        // Update current parameters
+                        let new_params_guard = new_params.lock().unwrap();
+                        let mut current_guard = current_params.lock().unwrap();
+                        
+                        current_guard.epochs = new_params_guard.epochs;
+                        current_guard.hidden_layers = new_params_guard.hidden_layers;
+                        current_guard.neurons_per_layer = new_params_guard.neurons_per_layer;
+                        current_guard.learning_rate = new_params_guard.learning_rate;
+                        current_guard.restart_training = new_params_guard.restart_training;
+                        
+                        println!("Received training parameters. Starting training...");
+                        
+                        // Create a copy for training
+                        let params = TrainingParams {
+                            epochs: current_guard.epochs,
+                            hidden_layers: current_guard.hidden_layers,
+                            neurons_per_layer: current_guard.neurons_per_layer,
+                            learning_rate: current_guard.learning_rate,
+                            restart_training: current_guard.restart_training,
+                        };
+                        
+                        break params;
+                    },
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Just a timeout, continue waiting
+                        continue;
+                    },
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // Channel closed, application is terminating
+                        println!("Training thread shutting down while waiting to start");
+                        return Ok(());
+                    }
+                }
+            };
+            
+            // Start training with received parameters
+            println!("Starting training with: {} epochs, {} hidden layers, {} neurons per layer, learning rate {}",
+                     train_params.epochs, train_params.hidden_layers, train_params.neurons_per_layer, train_params.learning_rate);
+            
+            if let Err(e) = train_network(&x, &y_true, &train_params, &accuracy_sender) {
+                eprintln!("Error during training: {}", e);
+            }
+            
+            println!("Training completed. Waiting for user to restart with new parameters.");
+        }
+        
+        Ok(())
+    });
+
+    // Let's handle potential errors from eframe more gracefully
+    if let Err(e) = eframe::run_native(
+        "Neural Network Training",
+        options,
+        Box::new(|_cc| Box::new(window)),
+    ) {
+        eprintln!("Error in UI: {}", e);
+    }
+    
+    if let Err(e) = training_thread.join().unwrap() {
+        eprintln!("Error in training: {}", e);
+    }
+
+    Ok(())
+}
+
