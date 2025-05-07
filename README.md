@@ -2,6 +2,8 @@
 
 This repository contains a collection of machine learning and data analysis projects implemented in Rust. Each project demonstrates different aspects of machine learning algorithms and their implementations.
 
+# Instrumentation Engineering Department
+
 Group 9
 1. Shandika Achmad Abdi Islami (2042221041)
 2. Nandina Zalsabila Ramadhoni (2042221059)
@@ -9,7 +11,6 @@ Group 9
 
 Supervisor : Ahmad Radhy, S.Si., M.Si
 
-# Instrumentation Engineering Department
 # Institut Teknologi Sepuluh Nopember
 
 ## Project Structure
