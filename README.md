@@ -9,8 +9,8 @@ Group 9
 
 Supervisor : Ahmad Radhy, S.Si., M.Si
 
-Instrumentation Engineering Department
-Institur Teknologi Sepuluh Nopember
+# Instrumentation Engineering Department
+# Institut Teknologi Sepuluh Nopember
 
 ## Project Structure
 
