@@ -3,9 +3,9 @@
 This repository contains a collection of machine learning and data analysis projects implemented in Rust. Each project demonstrates different aspects of machine learning algorithms and their implementations.
 
 Group 9
-Shandika Achmad Abdi Islami (2042221041)
-Nandina Zalsabila Ramadhoni (2042221059)
-Nina Zelika Fitri (2042221035)
+1. Shandika Achmad Abdi Islami (2042221041)
+2. Nandina Zalsabila Ramadhoni (2042221059)
+3. Nina Zelika Fitri (2042221035)
 
 Supervisor : Ahmad Radhy, S.Si., M.Si
 
